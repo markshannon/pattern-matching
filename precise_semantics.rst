@@ -21,7 +21,7 @@ This document outlines a well defined semantics for pattern matching in Python.
 It is not meant as a full proposal for pattern matching for Python, as the syntax is designed for clarity, 
 not elegance or ease of use.
 However, it is a necessary proposal, as the other proposals for pattern matching are imprecise, fragile and not implemented efficiently.
-This propsal is precise, robust, and describes how it can be implemented efficiently.
+This propsal is precise, robust, and describes how pattern matching can be implemented efficiently.
 
 This proposal shows that it is feasible to have a specification for pattern matching that has well defined semantics, 
 can be implemented efficiently and builds on existing concepts in Python, such as special methods.
@@ -29,8 +29,8 @@ can be implemented efficiently and builds on existing concepts in Python, such a
 We believe that a pattern matching implementation for Python must have the following three properties:
 
 * The semantics of pattern matching must be precisely defined.
-* It must be implemented efficiently. That is, it should perform at least as well as a well written series of ``if``, ``elif`` statements.
-* It must be robust in the face of changes to the environment. It should be defined in terms of the behaviour of objects, not global state.
+* It must be implemented efficiently. That is, it should perform at least as well as an equivalent sequence of ``if``, ``elif`` statements.
+* It must be resilient to changes to the environment. It should be defined in terms of the behaviour of objects, not global state.
 
 Syntax
 ======
@@ -105,8 +105,8 @@ The "$" prefix is arbitrary; any non-identifier character that is not already us
 Desugaring
 ----------
 
-The above syntax is designed to make the semantics clear, by making the test to match a pattern distinct from
-the assignment to variables.
+The above syntax is designed to help make the semantics clear,
+by keeping the pattern separate from the assignment to variables.
 
 Any syntactic element in a pattern that is the same as an expression is evaluated exactly as that expression.
 Any values captured are clearly marked as a ``CAPTURE_VARIABLE``. 
@@ -150,6 +150,19 @@ becomes
     case [$1, CONST] -> a:
         ...
 
+Or, using markers for variables (e.g. https://github.com/gvanrossum/patma/issues/143)
+
+::
+
+    case BinOp(^left, ADD, ^right):
+
+becomes
+
+::
+
+    case BinOp($1, ADD, $2) -> left, right:
+
+
 Further desugaring
 ''''''''''''''''''
 
@@ -176,7 +189,8 @@ becomes
       case B:
           body
           
-Second, the capture variables are renumbered so that they start from zero.
+Second, the capture variables must be renumbered, according to their position, starting at zero.
+
 
 Semantics
 =========
@@ -305,12 +319,8 @@ The matching process procedes as follows, for each pattern in the order specifie
 
 Once a match has been found, then perform the assignment and execute the case body.
 
-Additional desugaring for complex patterns
-''''''''''''''''''''''''''''''''''''''''''
-
-The above specification does not state how values are assigned to the capture variables.
-
-For capture patterns, it is explicit. However the more complex patterns need an addtional step.
+Additional desugaring for nested patterns
+'''''''''''''''''''''''''''''''''''''''''
 
 Inner patterns are desugared in the same way as outer patterns, taking advantage of the scoping rules to avoid name clashes.
 Note that the scope of the assignment is the enclosing scope.
@@ -321,11 +331,11 @@ For example:
 
   case Cls($1, Cls(0, $2, $3), $4) -> a,b,c,d:
 
-desugars by renumbering the inner pattern and assigning the inner pattern variables to the outer pattern variables.
+desugars by renumbering the inner pattern and assigning the inner pattern result to an outer pattern variable.
 
 ::
 
-  case Cls($0, (Cls(0, $0, $1)->$1, $2), $3) -> a,b,c,d
+  case Cls($0, (Cls(0, $0, $1)->$1), $2) -> a,(b,c),d
 
 Implementation
 ==============
@@ -411,7 +421,7 @@ Can be compiled roughly as:
 
 
 For variable length matches, rather than attempt to slice the list, it is probably more efficient to store
-the values before the ``*`` as discrete values, then pop the values are the ``*`` leaving the resulting list.
+the values to the left of the ``*`` as discrete values, then create a list, finally popping the values after the ``*``.
 
 For example:
 
@@ -483,7 +493,7 @@ Handling temporary variables
 
 For a stack machine based implementation, like CPython and PyPy,
 keeping temporary variables on the stack seems like the obvious strategy.
-It avoid any leakage of local variables, and is efficient.
+It avoids any leakage of local variables, and is quite efficient.
 
 Example
 -------
@@ -493,13 +503,13 @@ Consider the match statement
 ::
 
     match x:
-        case [$1] -> a:
+        case [$0] -> a:
             # Match a single element sequence
             A
-        case [$1, $2] if $1 > 3 -> a, b:
+        case [$0, $1] if $0 > 3 -> a, b:
             # Match a two element sequence if the first element is greater than 3
             B
-        case [$1, a] -> x:
+        case [$0, a] -> x:
             # Match a two element sequence if the second element is equal to a.
             C
         case []:
@@ -510,7 +520,7 @@ Consider the match statement
             # This is obviously silly code, but it is allowed for consistency.
             # `if x == print("testing"):` is legal.
             E
-        case $1 -> f:
+        case $0 -> f:
             # Match anything else
             F
 
@@ -551,7 +561,7 @@ Assuming that all variables are locals, a possible bytecode sequence is:
     # Code for A
     JUMP end
   case_B_or_C_or_E_or_F:
-    PEEK 2
+    PEEK 2  # $0
     LOAD_CONST 3
     COMPARE_OP >
     POP_JUMP_IF_FALSE case_C_or_E_or_F
