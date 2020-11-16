@@ -18,19 +18,96 @@ Abstract
 
 This document outlines a well defined semantics for pattern matching in Python.
 
-It is not meant as a full proposal for pattern matching for Python, as the syntax is designed for clarity, 
-not elegance or ease of use.
+It is not meant as a full proposal for pattern matching for Python, as the syntax is designed for clarity in desrcibing the semantics,
+not for elegance or ease of use.
+
 However, it is a necessary proposal, as the other proposals for pattern matching are imprecise, fragile and not implemented efficiently.
 This propsal is precise, robust, and describes how pattern matching can be implemented efficiently.
 
-This proposal shows that it is feasible to have a specification for pattern matching that has well defined semantics, 
+This proposal shows that it is feasible to have a specification for pattern matching that has well defined semantics,
 can be implemented efficiently and builds on existing concepts in Python, such as special methods.
 
-We believe that a pattern matching implementation for Python must have the following three properties:
+We believe that a pattern matching implementation for Python must have the following properties:
 
 * The semantics of pattern matching must be precisely defined.
 * It must be implemented efficiently. That is, it should perform at least as well as an equivalent sequence of ``if``, ``elif`` statements.
-* It must be resilient to changes to the environment. It should be defined in terms of the behaviour of objects, not global state.
+* Failed matches should not pollute the enclosing namespace.
+* Objects should be able determine which patterns they match.
+* It should distinguish, at much as possible, between a failed match and an erroneous pattern.
+
+This PEP proposes a model for pattern matching that has all five of the above properties.
+
+Properties
+==========
+
+
+Must have precisely defined semantics
+-------------------------------------
+
+Users need to know what pattern does in unusual circumstances.
+Debugging code is hard enough without having to guess what the implementation is doing.
+
+Without precise semantics, any changes to the implementation have to verified in an ad-hoc way,
+relying on test suites capturing the full range of behavior that is relied upon by users.
+The implementation, whatever it is, may become the de facto specification.
+
+It must be implemented efficiently
+----------------------------------
+
+Users should not have to pay an unnecessary performance penalty to use pattern matching.
+
+Failed matches should not pollute the enclosing namespace
+---------------------------------------------------------
+
+Users should not have to reverse engineer the internals of the matching process to work out which variables
+have been assigned. Matching should be an all-or-nothing process.
+
+Objects should be able determine which patterns they match
+----------------------------------------------------------
+
+Python is at its heart an object-oriented language with a powerful object model that allows objects control over all aspects of their behavior.
+Pattern matching should not be an exception to this. Pattern matching is just one langauge construct amongst many;
+it is in no way more fundamental than addition or iteration.
+
+It should distinguish between a failed match and an erroneous pattern
+---------------------------------------------------------------------
+
+Patterns should be able to distinguish between different objects that they appear to differentiate, and should match at least some objects.
+Objects should be deconstructed in a meaningful way when they match.
+When a pattern fails to do this, it should be considered erroneous.
+
+For example, consider the named tuple
+
+::
+
+    namedtuple('RemoteCount', ['success', 'total'])
+
+now consider the match (using PEP 622 syntax for this example):
+
+::
+
+    case RemoteCount(success=True, count=count):
+        ...
+
+This is an erroneous pattern, as it uses ``count`` instead of ``total``.
+
+Attempting to match this pattern against ``RemoteCount(True, 3)`` should raise an exception,
+not set ``count = RemoteCount(True, 3).count``, even though the attribute access ``RemoteCount.count`` is not an error.
+    
+::
+
+    >>> RemoteCount(True, 3).count
+    <built-in method count of RemoteCount object at ...>
+
+
+This property is harder to define and harder to implement than the above, but implementations should make a reasonable effort at handling erroneous patterns.
+
+
+PEP 634 and PEP 642
+-------------------
+
+Both PEP 634 and PEP 642 fail to satisfy *any* of the above properties.
+
 
 Syntax
 ======
@@ -74,12 +151,12 @@ Patterns
     | CAPTURE_VARIABLE
     | mapping_pattern
     | sequence_pattern
-    | deconstruct_pattern
+    | class_pattern
     | expression
 
 A ``pattern_guard`` has the same syntax as a ``named_expression``, but allows a CAPTURE_VARIABLE as an additional atom.
 
-The ``CAPTURE_VARIABLE`` token is a dollar followed by a decimal number. E.g. ``$2``
+The ``CAPTURE_VARIABLE`` token is a dollar, followed by a decimal number, e.g. ``$2``.
 
 This design requires that capture variables are lexically distinct from normal variables.
 The "$" prefix is arbitrary; any non-identifier character that is not already used in Python would work.
@@ -96,11 +173,20 @@ The "$" prefix is arbitrary; any non-identifier character that is not already us
 
 ::
 
-  deconstruct_pattern:
+  class_pattern:
     | class_name '(' named_pattern (',' named_pattern)* [','] ')'
     | class_name '(' [ pattern (',' pattern)* [','] ] ')'
   class_name: NAME ('.' NAME)*
   named_pattern: NAME '=' pattern
+
+Resolving syntactic ambiguity
+'''''''''''''''''''''''''''''
+
+In case the above rules are ambiguous, the following rules also apply:
+
+* A pattern must contain at least one ``CAPTURE_VARIABLE``
+* An expression cannot contain any ``CAPTURE_VARIABLE``\ s.
+
 
 Desugaring
 ----------
@@ -109,7 +195,7 @@ The above syntax is designed to help make the semantics clear,
 by keeping the pattern separate from the assignment to variables.
 
 Any syntactic element in a pattern that is the same as an expression is evaluated exactly as that expression.
-Any values captured are clearly marked as a ``CAPTURE_VARIABLE``. 
+Any values captured are clearly marked as a ``CAPTURE_VARIABLE``.
 
 Other proposals for pattern matching either prohibit certain syntaxes within patterns or use a "sigil" (a special character)
 to either mark binding variables, or to mark non-binding variables.
@@ -131,9 +217,9 @@ becomes
 
 ::
 
-    case [$1, $2] -> a, b:
+    case [$0, $1] -> a, b:
         ...
-    case BinOp($1, "+", $2) -> l, r:
+    case BinOp($0, "+", $1) -> l, r:
         ...
 
 PEP 642:
@@ -147,7 +233,7 @@ becomes
 
 ::
 
-    case [$1, CONST] -> a:
+    case [$0, CONST] -> a:
         ...
 
 Or, using markers for variables (e.g. https://github.com/gvanrossum/patma/issues/143)
@@ -160,7 +246,7 @@ becomes
 
 ::
 
-    case BinOp($1, ADD, $2) -> left, right:
+    case BinOp($0, ADD, $1) -> left, right:
 
 
 Further desugaring
@@ -188,8 +274,9 @@ becomes
           body
       case B:
           body
-          
+
 Second, the capture variables must be renumbered, according to their position, starting at zero.
+From now on, all examples will include correctly numbered capture variables.
 
 
 Semantics
@@ -210,25 +297,24 @@ It must return one of:
   MATCH_CLASS
 
 .. note::
-
     For the purposes of this semantics, it does not matter what the actual values are.
     We will refer to them by name only. In practice, they will most likely be small integers.
 
 ``object.__match_kind__()`` will return ``MATCH_VALUE``.
 
-Classes that return ``MATCH_CLASS`` need to implement two additional special methods:
+Classes that return ``MATCH_CLASS`` need to implement one additional special attributes, and one special method:
 
-* ``__attributes__()``: must return a tuple of strings indicating the names of attributes that are to be considered for matching.
+* ``__attributes__``: must hold a tuple of strings indicating the names of attributes that are to be considered for matching.
 * ``__deconstruct__()``: must return a sequence of the same length as the tuple returned from ``__attributes__`` which contains the values corresponding to the attribute names.
 
 .. note::
-
     ``__attributes__`` and ``__deconstruct__`` will be automatically
     generated for dataclasses and named tuples.
 
-The pattern matching implementation is *not* required to check that the values returned by ``__attributes__`` or ``__deconstruct__`` are as specified.
-If the result of ``__attributes__()`` or ``__deconstruct__`` is not as specified, then
+The pattern matching implementation is *not* required to check that ``__attributes__`` and ``__deconstruct__`` behave as specified.
+If the value of ``__attributes__`` or the result of ``__deconstruct__()`` is not as specified, then
 the implementation may raise any exception, or match the wrong pattern.
+Of course, implementations are free to check these properties and provide meaningful error messages if they can do so efficiently.
 
 Matching
 --------
@@ -258,21 +344,20 @@ Once a match has been found, and only once a match has been found, will values b
 Before any patterns are examined, ``__match_kind__()`` is called and the result stored in ``$kind``.
 The matching process procedes as follows, for each pattern in the order specified until a match is found:
 
-1. Fail to match if the pattern does not apply to ``$kind``.
+1. If the pattern does not apply to ``$kind``, then skip the match.
 
    * ``capture_pattern`` applies to all kinds
    * ``expression`` applies to all kinds
    * ``mapping_pattern`` applies to ``MATCH_MAPPING``
    * ``sequence_pattern`` applies to ``MATCH_SEQUENCE``
-   * ``deconstruct_pattern`` applies to ``MATCH_CLASS``
+   * ``class_pattern`` applies to ``MATCH_CLASS``
 
 2. Match against the pattern:
 
    * A ``capture_pattern`` is always a match.
    * For an ``expression`` perform an equality test with the object. If equal, then the pattern matches.
-    
-     .. note::
 
+     .. note::
         We are sidestepping the issue of whether ``True`` should match ``1`` or not.
         The issues involved are exactly the same as for PEP 634.
         Whatever is chosen, it should be symmetric. That is, if ``True`` does not match ``1``, then ``1`` must not match ``True``.
@@ -280,12 +365,11 @@ The matching process procedes as follows, for each pattern in the order specifie
    * For a ``sequence_pattern``:
 
      a. If this is the first ``sequence_pattern``: iterate over the object forming a list. Store that list in ``$values``.
-    
-        .. note::
 
+        .. note::
           Implementations are allowed to treat iteration steps are side-effect free, but not the process of creating an iterator.
           Consequently, objects that match sequences should not rely on iterators being exhausted, but can rely on an iterator being created.
-     
+
      b. If the length of ``$values`` is not within the range of lengths for the pattern, then proceed to the next case
      c. Check each sub-pattern for a match in depth-first, left-to-right order. If any sub-pattern  match fails, then the whole match fails.
 
@@ -294,18 +378,18 @@ The matching process procedes as follows, for each pattern in the order specifie
      a. Evaluate ``m = bool(all(key in obj for key in keys))`` where ``keys`` is the list of keys in the pattern. If ``m`` is false then the match fails.
      b. Check each sub-pattern for a match in depth-first, left-to-right order. If any sub-pattern  match fails, then the whole match fails.
 
-   * For a ``deconstruct_pattern``:
+   * For a ``class_pattern``:
 
-     a. If this is the first ``deconstruct_pattern``:
-    
+     a. If this is the first ``class_pattern``:
+
         * Store ``type(obj)`` in ``$cls``
-        * If this is the first ``deconstruct_pattern`` to contain named attributes, then call ``__attributes__`` and store it to ``$attrs``.
+        * If this is the first ``class_pattern`` to contain named attributes, then call ``__attributes__`` and store it to ``$attrs``.
         * Call ``__deconstruct__`` and store it in ``$values``.
 
      b. If ``not issubclass($cls, pcls)`` where ``pcls`` is the result of evaluating the expression defining the class in the pattern, then the match fails.
      c. If the pattern contains named patterns, then pattern variables are assigned with ``$n = $values[$attrs.index(name)]``.
      d. If the pattern does not contain named patterns, then pattern variables are assigned with ``$n = $values[n]``.
-     
+
         .. note::
           If ``$attrs.index(name)`` raises a ``ValueError``, the implementation must convert it to an ``AttributeError``.
           If ``$values[n]`` raises an ``IndexError``, the implementation must convert it to a ``TypeError``.
@@ -329,7 +413,7 @@ For example:
 
 ::
 
-  case Cls($1, Cls(0, $2, $3), $4) -> a,b,c,d:
+  case Cls($0, Cls(0, $1, $2), $3) -> a,b,c,d:
 
 desugars by renumbering the inner pattern and assigning the inner pattern result to an outer pattern variable.
 
@@ -361,7 +445,7 @@ but guidelines to help developers create an efficient implementation.
 Splitting evaluation into lanes
 '''''''''''''''''''''''''''''''
 
-Since the first step in matching each pattern is check to against the kind, it is possible to move the check against kind to the beginning 
+Since the first step in matching each pattern is check to against the kind, it is possible to move the check against kind to the beginning
 of the match. The list of cases can then be duplicated into several "lanes" each corresponding to one kind of pattern.
 It is then trivial to remove unmatchable cases from each lane.
 Depending on the kind, different optimization strategies are possible for each lane.
@@ -481,10 +565,10 @@ The mapping lane can be implemented, roughly as:
   goto Z
 
 
-Desconstruct patterns
-'''''''''''''''''''''
+Deconstruction patterns
+'''''''''''''''''''''''
 
-This offers the least opportunity for optimisation. If there are multiple cases for the same class,
+This pattern probably offers the least opportunity for optimisation. If there are multiple cases for the same class,
 then a similar optimisation as for mapping might be used to avoid some tests.
 
 
@@ -517,8 +601,7 @@ Consider the match statement
             D
         case print("testing"):
             # Matches None, and prints "testing" as a side effect.
-            # This is obviously silly code, but it is allowed for consistency.
-            # `if x == print("testing"):` is legal.
+            # This is obviously silly code, but it is allowed.
             E
         case $0 -> f:
             # Match anything else
@@ -601,7 +684,7 @@ Assuming that all variables are locals, a possible bytecode sequence is:
   end:
 
 The above code is efficient as it checks against patterns as the sequence is iterated over.
-It does this while obeying the specified semantics as it acts *as if* each pattern were matched in turn.
+It does this while obeying the specified semantics, acting *as if* each pattern were matched in turn.
 
 
 Conclusion
@@ -615,11 +698,6 @@ Having precise semantics helps, not hinders, optimization
 
 Having precise semantics means that the range of possible implementations is well defined.
 It is possible to determine what is a legal transformation and what is not.
-
-Without precise semantics, any changes to the implementation have to verified in an ad-hoc way,
-relying on test suites capturing the full range of behavior that is relied upon by users.
-The implementation, whatever it is, may become the de facto specification.
-
 
 Copyright
 =========
